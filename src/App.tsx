@@ -478,7 +478,7 @@ function App() {
 
       return peer;
     });
-
+  }
 
   async function flushPendingIceCandidates(
     peer: RTCPeerConnection,

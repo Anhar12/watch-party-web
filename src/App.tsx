@@ -8,6 +8,12 @@ import { io, Socket } from "socket.io-client";
 
 import "./App.css";
 
+declare global {
+  interface HTMLVideoElement {
+    captureStream(): MediaStream;
+  }
+}
+
 type Role = "host" | "viewer";
 
 type ConnectionStatus =
@@ -110,8 +116,8 @@ function App() {
 	const [displayPosition, setDisplayPosition] =
   	useState(0);
 
-	const [connectionStatus, setConnectionStatus] =
-  	useState<ConnectionStatus>("connecting");
+	const [, setConnectionStatus] =
+ 		useState<ConnectionStatus>("connecting");
 
   function log(text: string) {
     console.log(text);

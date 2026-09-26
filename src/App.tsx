@@ -65,8 +65,8 @@ function App() {
   const localStreamRef =
     useRef<MediaStream | null>(null);
 
-  const localAudioTrackRef =
-    useRef<MediaStreamTrack | null>(null);
+  const localVideoStreamRef =
+    useRef<MediaStream | null>(null);
 
   const viewerIdRef =
     useRef<string | null>(null);
@@ -353,15 +353,6 @@ function App() {
 
     const handlePlaybackChange = () => {
       sendPlaybackState();
-
-      if (!video.paused) {
-        const peer = peerConnectionRef.current;
-        const viewerId = viewerIdRef.current;
-
-        if (peer && viewerId) {
-          void syncAudioTrack(peer, video, viewerId);
-        }
-      }
     };
 
     const handleEnded = () => {
@@ -695,11 +686,10 @@ function App() {
     peer: RTCPeerConnection,
     video: HTMLVideoElement,
   ): Promise<boolean> {
-    // Capture the currently selected source. Tracks from the previous
-    // source can remain in the peer connection after video.src changes.
+    // Keep the original audio capture track for the lifetime of the peer.
+    // Only refresh the video track when the host selects another file.
     const stream = video.captureStream();
     const videoTrack = stream.getVideoTracks()[0];
-    const audioTrack = stream.getAudioTracks()[0] ?? null;
 
     if (!videoTrack) {
       stream.getTracks().forEach((track) => track.stop());
@@ -717,116 +707,52 @@ function App() {
       .find((transceiver) => transceiver.receiver.track.kind === "video")
       ?.sender;
 
-    if (videoSender) {
-      await videoSender.replaceTrack(videoTrack);
-    } else {
-      peer.addTrack(videoTrack, stream);
-      needsNegotiation = true;
-    }
+    if (localStreamRef.current) {
+      if (videoSender) {
+        await videoSender.replaceTrack(videoTrack);
+      } else {
+        peer.addTrack(videoTrack, stream);
+        needsNegotiation = true;
+      }
 
-    const audioSender = peer
-      .getTransceivers()
-      .find((transceiver) => transceiver.receiver.track.kind === "audio")
-      ?.sender;
+      const previousVideoStream = localVideoStreamRef.current;
+      localVideoStreamRef.current = stream;
 
-    if (audioSender) {
-      // A selected file may not expose its audio track until playback starts.
-      // Keep the current sender until syncAudioTrack can attach the new one.
-      if (audioTrack) {
-        await audioSender.replaceTrack(audioTrack);
-        if (
-          localAudioTrackRef.current &&
-          localAudioTrackRef.current !== audioTrack
-        ) {
-          localAudioTrackRef.current.stop();
+      previousVideoStream?.getVideoTracks().forEach((track) => {
+        if (track !== videoTrack) {
+          track.stop();
         }
-        localAudioTrackRef.current = audioTrack;
+      });
+
+      // The original stream owns the audio track. This fresh stream is used
+      // only for its replacement video track.
+      const originalAudioTracks = new Set(
+        localStreamRef.current.getAudioTracks(),
+      );
+      stream.getAudioTracks().forEach((track) => {
+        if (!originalAudioTracks.has(track)) {
+          track.stop();
+        }
+      });
+    } else {
+      const audioTrack = stream.getAudioTracks()[0];
+
+      peer.addTrack(videoTrack, stream);
+
+      if (audioTrack) {
+        peer.addTrack(audioTrack, stream);
       }
-    } else if (audioTrack) {
-      peer.addTrack(audioTrack, stream);
-      if (
-        localAudioTrackRef.current &&
-        localAudioTrackRef.current !== audioTrack
-      ) {
-        localAudioTrackRef.current.stop();
-      }
-      localAudioTrackRef.current = audioTrack;
+
+      localStreamRef.current = stream;
+      localVideoStreamRef.current = stream;
       needsNegotiation = true;
     }
-
-    const previousStream = localStreamRef.current;
-    localStreamRef.current = stream;
-    const activeTracks = new Set(
-      peer.getSenders().flatMap((sender) =>
-        sender.track ? [sender.track] : [],
-      ),
-    );
-
-    previousStream?.getTracks().forEach((track) => {
-      if (
-        track !== videoTrack &&
-        track !== audioTrack &&
-        !activeTracks.has(track)
-      ) {
-        track.stop();
-      }
-    });
 
     log(
-      `Capture stream attached: video=${!!videoTrack}, audio=${!!audioTrack}, renegotiation=${needsNegotiation}`,
+      `Capture stream attached: video=${!!videoTrack}, audio=${!!localStreamRef.current?.getAudioTracks()[0]}, renegotiation=${needsNegotiation}`,
     );
 
     return needsNegotiation;
-  }
-
-  async function syncAudioTrack(
-    peer: RTCPeerConnection,
-    video: HTMLVideoElement,
-    viewerId: string,
-  ) {
-    const stream = video.captureStream();
-    const audioTrack = stream.getAudioTracks()[0];
-
-    stream.getVideoTracks().forEach((track) => track.stop());
-
-    if (!audioTrack) {
-      return;
-    }
-
-    const audioSender = peer
-      .getTransceivers()
-      .find((transceiver) => transceiver.receiver.track.kind === "audio")
-      ?.sender;
-
-    if (audioSender) {
-      await audioSender.replaceTrack(audioTrack);
-    } else {
-      peer.addTrack(
-        audioTrack,
-        localStreamRef.current ?? stream,
-      );
-
-      if (peer.signalingState === "stable") {
-        const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
-
-        socketRef.current?.emit("webrtc-offer", {
-          target: viewerId,
-          offer: peer.localDescription,
-        });
-
-        log("WebRTC renegotiation offer sent for audio track");
-      }
-    }
-
-    if (
-      localAudioTrackRef.current &&
-      localAudioTrackRef.current !== audioTrack
-    ) {
-      localAudioTrackRef.current.stop();
-    }
-
-    localAudioTrackRef.current = audioTrack;
   }
 
   async function startWebRTC(
@@ -1181,16 +1107,18 @@ function App() {
 
 		peerConnectionRef.current = null;
 
-		localStreamRef.current
-			?.getTracks()
-			.forEach((track) => {
+		const streamsToStop = new Set(
+			[localStreamRef.current, localVideoStreamRef.current]
+				.filter((stream): stream is MediaStream => Boolean(stream)),
+		);
+		streamsToStop.forEach((stream) => {
+			stream.getTracks().forEach((track) => {
 				track.stop();
 			});
+		});
 
 		localStreamRef.current = null;
-
-		localAudioTrackRef.current?.stop();
-		localAudioTrackRef.current = null;
+		localVideoStreamRef.current = null;
 
 		if (
 			remoteVideoRef.current

@@ -53,6 +53,9 @@ function App() {
   const remoteVideoRef =
     useRef<HTMLVideoElement | null>(null);
 
+  const remoteStreamRef =
+    useRef<MediaStream | null>(null);
+
   const peerConnectionRef =
     useRef<RTCPeerConnection | null>(null);
 
@@ -62,6 +65,9 @@ function App() {
   const localStreamRef =
     useRef<MediaStream | null>(null);
 
+  const localAudioTrackRef =
+    useRef<MediaStreamTrack | null>(null);
+
   const viewerIdRef =
     useRef<string | null>(null);
 
@@ -70,6 +76,9 @@ function App() {
 
   const playbackIntervalRef =
     useRef<number | null>(null);
+  
+  const mediaUpdateIdRef =
+    useRef(0);
 
   const [connected, setConnected] =
     useState(false);
@@ -96,6 +105,9 @@ function App() {
     useState(0);
 
   const [remotePlaying, setRemotePlaying] =
+    useState(false);
+
+  const [remotePlaybackBlocked, setRemotePlaybackBlocked] =
     useState(false);
 
 	const [remoteUpdatedAt, setRemoteUpdatedAt] =
@@ -329,62 +341,86 @@ function App() {
   }, []);
 
 	useEffect(() => {
-		if (role !== "host") {
-			return;
-		}
+    if (role !== "host") {
+      return;
+    }
 
-		const video = localVideoRef.current;
+    const video = localVideoRef.current;
 
-		if (!video) {
-			return;
-		}
+    if (!video) {
+      return;
+    }
 
-		const handlePlaybackChange = () => {
-			sendPlaybackState();
-		};
+    const handlePlaybackChange = () => {
+      sendPlaybackState();
 
-		video.addEventListener(
-			"play",
-			handlePlaybackChange,
-		);
+      if (!video.paused) {
+        const peer = peerConnectionRef.current;
+        const viewerId = viewerIdRef.current;
 
-		video.addEventListener(
-			"pause",
-			handlePlaybackChange,
-		);
+        if (peer && viewerId) {
+          void syncAudioTrack(peer, video, viewerId);
+        }
+      }
+    };
 
-		video.addEventListener(
-			"seeked",
-			handlePlaybackChange,
-		);
+    const handleEnded = () => {
+      log("Host video ended.");
+      sendPlaybackState();
+    };
 
-		video.addEventListener(
-			"loadedmetadata",
-			handlePlaybackChange,
-		);
+    video.addEventListener(
+      "play",
+      handlePlaybackChange,
+    );
 
-		return () => {
-			video.removeEventListener(
-				"play",
-				handlePlaybackChange,
-			);
+    video.addEventListener(
+      "pause",
+      handlePlaybackChange,
+    );
 
-			video.removeEventListener(
-				"pause",
-				handlePlaybackChange,
-			);
+    video.addEventListener(
+      "seeked",
+      handlePlaybackChange,
+    );
 
-			video.removeEventListener(
-				"seeked",
-				handlePlaybackChange,
-			);
+    video.addEventListener(
+      "loadedmetadata",
+      handlePlaybackChange,
+    );
 
-			video.removeEventListener(
-				"loadedmetadata",
-				handlePlaybackChange,
-			);
-		};
-	}, [role]);
+    video.addEventListener(
+      "ended",
+      handleEnded,
+    );
+
+    return () => {
+      video.removeEventListener(
+        "play",
+        handlePlaybackChange,
+      );
+
+      video.removeEventListener(
+        "pause",
+        handlePlaybackChange,
+      );
+
+      video.removeEventListener(
+        "seeked",
+        handlePlaybackChange,
+      );
+
+      video.removeEventListener(
+        "loadedmetadata",
+        handlePlaybackChange,
+      );
+
+      video.removeEventListener(
+        "ended",
+        handleEnded,
+      );
+    };
+  }, [role]);
 
 	useEffect(() => {
 		if (
@@ -494,13 +530,38 @@ function App() {
 
     peer.ontrack = (event) => {
       const stream =
-        event.streams[0];
+        remoteStreamRef.current ?? new MediaStream();
+
+      for (const incomingStream of event.streams) {
+        for (const track of incomingStream.getTracks()) {
+          if (!stream.getTracks().includes(track)) {
+            stream.addTrack(track);
+          }
+        }
+      }
+
+      if (!stream.getTracks().includes(event.track)) {
+        stream.addTrack(event.track);
+      }
+
+      remoteStreamRef.current = stream;
 
       if (
         remoteVideoRef.current
       ) {
-        remoteVideoRef.current.srcObject =
-          stream;
+        const remoteVideo = remoteVideoRef.current;
+        remoteVideo.srcObject = stream;
+
+        void remoteVideo.play()
+          .then(() => {
+            setRemotePlaybackBlocked(false);
+          })
+          .catch((error: unknown) => {
+            setRemotePlaybackBlocked(true);
+            log(
+              `Playback needs user interaction: ${String(error)}`,
+            );
+          });
       }
 
       log(
@@ -630,153 +691,193 @@ function App() {
 			}, 500);
 	}
 
-	async function attachVideoToPeer(
-		peer: RTCPeerConnection,
-		video: HTMLVideoElement,
-	) {
-		const previousStream =
-			localStreamRef.current;
+  async function attachVideoToPeer(
+    peer: RTCPeerConnection,
+    video: HTMLVideoElement,
+  ): Promise<boolean> {
+    // Capture the currently selected source. Tracks from the previous
+    // source can remain in the peer connection after video.src changes.
+    const stream = video.captureStream();
+    const videoTrack = stream.getVideoTracks()[0];
+    const audioTrack = stream.getAudioTracks()[0] ?? null;
 
-		const stream =
-			video.captureStream();
+    if (!videoTrack) {
+      stream.getTracks().forEach((track) => track.stop());
+      log("No video track available from captureStream.");
+      return false;
+    }
 
-		localStreamRef.current =
-			stream;
+    if ("contentHint" in videoTrack) {
+      videoTrack.contentHint = "detail";
+    }
 
-		const videoTrack =
-			stream.getVideoTracks()[0];
+    let needsNegotiation = false;
+    const videoSender = peer
+      .getTransceivers()
+      .find((transceiver) => transceiver.receiver.track.kind === "video")
+      ?.sender;
 
-		if ("contentHint" in videoTrack) {
-			videoTrack.contentHint =
-				"detail";
-		}
+    if (videoSender) {
+      await videoSender.replaceTrack(videoTrack);
+    } else {
+      peer.addTrack(videoTrack, stream);
+      needsNegotiation = true;
+    }
 
-		const audioTrack =
-			stream.getAudioTracks()[0];
+    const audioSender = peer
+      .getTransceivers()
+      .find((transceiver) => transceiver.receiver.track.kind === "audio")
+      ?.sender;
 
-		const existingVideoSender =
-			peer
-				.getSenders()
-				.find(
-					(sender) =>
-						sender.track?.kind ===
-						"video",
-				);
+    if (audioSender) {
+      // A selected file may not expose its audio track until playback starts.
+      // Keep the current sender until syncAudioTrack can attach the new one.
+      if (audioTrack) {
+        await audioSender.replaceTrack(audioTrack);
+        if (
+          localAudioTrackRef.current &&
+          localAudioTrackRef.current !== audioTrack
+        ) {
+          localAudioTrackRef.current.stop();
+        }
+        localAudioTrackRef.current = audioTrack;
+      }
+    } else if (audioTrack) {
+      peer.addTrack(audioTrack, stream);
+      if (
+        localAudioTrackRef.current &&
+        localAudioTrackRef.current !== audioTrack
+      ) {
+        localAudioTrackRef.current.stop();
+      }
+      localAudioTrackRef.current = audioTrack;
+      needsNegotiation = true;
+    }
 
-		const existingAudioSender =
-			peer
-				.getSenders()
-				.find(
-					(sender) =>
-						sender.track?.kind ===
-						"audio",
-				);
+    const previousStream = localStreamRef.current;
+    localStreamRef.current = stream;
+    const activeTracks = new Set(
+      peer.getSenders().flatMap((sender) =>
+        sender.track ? [sender.track] : [],
+      ),
+    );
 
-		if (existingVideoSender) {
-			await existingVideoSender.replaceTrack(
-				videoTrack,
-			);
-		} else {
-			peer.addTrack(
-				videoTrack,
-				stream,
-			);
-		}
+    previousStream?.getTracks().forEach((track) => {
+      if (
+        track !== videoTrack &&
+        track !== audioTrack &&
+        !activeTracks.has(track)
+      ) {
+        track.stop();
+      }
+    });
 
-		if (audioTrack) {
-			if (existingAudioSender) {
-				await existingAudioSender.replaceTrack(
-					audioTrack,
-				);
-			} else {
-				peer.addTrack(
-					audioTrack,
-					stream,
-				);
-			}
-		}
+    log(
+      `Capture stream attached: video=${!!videoTrack}, audio=${!!audioTrack}, renegotiation=${needsNegotiation}`,
+    );
 
-		if (previousStream && previousStream !== stream) {
-			previousStream.getTracks().forEach((track) => {
-				track.stop();
-			});
-		}
-	}
+    return needsNegotiation;
+  }
+
+  async function syncAudioTrack(
+    peer: RTCPeerConnection,
+    video: HTMLVideoElement,
+    viewerId: string,
+  ) {
+    const stream = video.captureStream();
+    const audioTrack = stream.getAudioTracks()[0];
+
+    stream.getVideoTracks().forEach((track) => track.stop());
+
+    if (!audioTrack) {
+      return;
+    }
+
+    const audioSender = peer
+      .getTransceivers()
+      .find((transceiver) => transceiver.receiver.track.kind === "audio")
+      ?.sender;
+
+    if (audioSender) {
+      await audioSender.replaceTrack(audioTrack);
+    } else {
+      peer.addTrack(
+        audioTrack,
+        localStreamRef.current ?? stream,
+      );
+
+      if (peer.signalingState === "stable") {
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+
+        socketRef.current?.emit("webrtc-offer", {
+          target: viewerId,
+          offer: peer.localDescription,
+        });
+
+        log("WebRTC renegotiation offer sent for audio track");
+      }
+    }
+
+    if (
+      localAudioTrackRef.current &&
+      localAudioTrackRef.current !== audioTrack
+    ) {
+      localAudioTrackRef.current.stop();
+    }
+
+    localAudioTrackRef.current = audioTrack;
+  }
 
   async function startWebRTC(
-		viewerId: string,
-	) {
-		const video =
-			localVideoRef.current;
+    viewerId: string,
+    expectedUpdateId?: number,
+  ) {
+    const video = localVideoRef.current;
 
-		if (!video?.src) {
-			log(
-				"No host video selected.",
-			);
+    if (!video?.src) {
+      log("No host video selected.");
+      return;
+    }
 
-			return;
-		}
+    await waitForVideoReady(video);
 
-		await waitForVideoReady(video);
+    if (
+      expectedUpdateId !== undefined &&
+      expectedUpdateId !== mediaUpdateIdRef.current
+    ) {
+      return;
+    }
 
-		let peer =
-			peerConnectionRef.current;
+    let peer = peerConnectionRef.current;
 
-		/*
-		* Kalau belum ada connection,
-		* buat baru.
-		*/
-		if (!peer) {
-			peer =
-				createPeerConnection(
-					viewerId,
-				);
+    if (!peer) {
+      peer = createPeerConnection(viewerId);
 
-			const channel =
-				peer.createDataChannel(
-					"watch-party",
-				);
+      const channel = peer.createDataChannel("watch-party");
+      setupDataChannel(channel);
+    }
 
-			setupDataChannel(
-				channel,
-			);
-		}
+    const needsNegotiation =
+      await attachVideoToPeer(peer, video);
 
-		/*
-		* Tambahkan atau ganti video/audio.
-		*/
-		await attachVideoToPeer(
-			peer,
-			video,
-		);
+    await configureVideoSender(peer);
 
-		await configureVideoSender(
-			peer,
-		);
+    if (needsNegotiation) {
+      const offer = await peer.createOffer();
 
-		/*
-		* Renegotiation.
-		*/
-		const offer =
-			await peer.createOffer();
+      await peer.setLocalDescription(offer);
 
-		await peer.setLocalDescription(
-			offer,
-		);
+      socketRef.current?.emit("webrtc-offer", {
+        target: viewerId,
+        offer: peer.localDescription,
+      });
 
-		socketRef.current?.emit(
-			"webrtc-offer",
-			{
-				target: viewerId,
-				offer:
-					peer.localDescription,
-			},
-		);
-
-		log(
-			"WebRTC offer sent / renegotiation started",
-		);
-	}
+      log("WebRTC offer sent");
+    } else {
+      log("Existing capture stream reused; no renegotiation needed");
+    }
+  }
 
   async function handleOffer(
 		senderId: string,
@@ -908,11 +1009,18 @@ function App() {
       return;
     }
 
+    const updateId =
+      ++mediaUpdateIdRef.current;
+
     if (videoUrlRef.current) {
-      URL.revokeObjectURL(videoUrlRef.current);
+      URL.revokeObjectURL(
+        videoUrlRef.current,
+      );
     }
 
-    const url = URL.createObjectURL(file);
+    const url =
+      URL.createObjectURL(file);
+
     videoUrlRef.current = url;
 
     video.src = url;
@@ -920,16 +1028,32 @@ function App() {
 
     setVideoName(file.name);
 
+    log(
+      `Selected: ${file.name}`,
+    );
 
-    log(`Selected: ${file.name}`);
-
-    if (viewerIdRef.current) {
-      await waitForVideoReady(video);
-
-      await startWebRTC(
-        viewerIdRef.current,
-      );
+    if (!viewerIdRef.current) {
+      return;
     }
+
+    await waitForVideoReady(video);
+
+    /*
+    * Kalau user sudah memilih video lain
+    * selama kita menunggu video siap,
+    * operasi ini sudah basi.
+    */
+    if (
+      updateId !==
+      mediaUpdateIdRef.current
+    ) {
+      return;
+    }
+
+    await startWebRTC(
+      viewerIdRef.current,
+      updateId,
+    );
   }
 
 	function waitForVideoReady(
@@ -1008,6 +1132,22 @@ function App() {
     video.requestFullscreen?.();
   }
 
+  function playRemoteVideo() {
+    const video = remoteVideoRef.current;
+
+    if (!video) {
+      return;
+    }
+
+    void video.play()
+      .then(() => {
+        setRemotePlaybackBlocked(false);
+      })
+      .catch((error: unknown) => {
+        log(`Unable to play remote video: ${String(error)}`);
+      });
+  }
+
   function handleVolumeChange(
     value: number,
   ) {
@@ -1049,12 +1189,17 @@ function App() {
 
 		localStreamRef.current = null;
 
+		localAudioTrackRef.current?.stop();
+		localAudioTrackRef.current = null;
+
 		if (
 			remoteVideoRef.current
 		) {
 			remoteVideoRef.current.srcObject =
 				null;
 		}
+
+		remoteStreamRef.current = null;
 	}
 
 	function leaveRoom() {
@@ -1286,13 +1431,23 @@ function App() {
               </p>
             </div>
 
-            <div className="overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
+            <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
               <video
                 ref={remoteVideoRef}
                 autoPlay
                 playsInline
+                onPlaying={() => setRemotePlaybackBlocked(false)}
                 className="aspect-video w-full bg-black"
               />
+
+              {remotePlaybackBlocked && (
+                <button
+                  onClick={playRemoteVideo}
+                  className="absolute inset-0 flex items-center justify-center bg-black/60 px-6 text-center font-semibold text-white"
+                >
+                  Tap to play the stream
+                </button>
+              )}
 
               <div className="flex items-center gap-4 border-t border-white/10 bg-slate-900 px-4 py-3">
                 <span className="min-w-[95px] text-sm font-mono text-slate-300">

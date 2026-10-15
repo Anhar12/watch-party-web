@@ -4,7 +4,15 @@ import "./App.css";
 
 declare global {
   interface HTMLVideoElement {
-    captureStream(): MediaStream;
+    captureStream?: () => MediaStream;
+    webkitDisplayingFullscreen?: boolean;
+    webkitEnterFullscreen?: () => void;
+    webkitExitFullscreen?: () => void;
+  }
+
+  interface Document {
+    webkitExitFullscreen?: () => void;
+    webkitFullscreenElement?: Element | null;
   }
 }
 
@@ -1026,17 +1034,47 @@ function App() {
     setMessage("");
   }
 
-  function toggleFullscreen() {
+  async function toggleFullscreen() {
     const video = remoteVideoRef.current;
 
     if (!video) return;
 
-    if (document.fullscreenElement) {
-      void document.exitFullscreen();
-      return;
-    }
+    try {
+      if (video.webkitDisplayingFullscreen) {
+        video.webkitExitFullscreen?.();
+        return;
+      }
 
-    void video.requestFullscreen?.();
+      if (
+        document.fullscreenElement ||
+        document.webkitFullscreenElement
+      ) {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else {
+          document.webkitExitFullscreen?.();
+        }
+
+        return;
+      }
+
+      // Safari on iPhone does not reliably expose the standard
+      // Fullscreen API for page elements. Its native video player
+      // uses this WebKit method instead.
+      if (video.webkitEnterFullscreen) {
+        video.webkitEnterFullscreen();
+        return;
+      }
+
+      if (video.requestFullscreen) {
+        await video.requestFullscreen();
+        return;
+      }
+
+      log("Fullscreen is not supported by this browser.");
+    } catch (error) {
+      log(`Unable to enter fullscreen: ${String(error)}`);
+    }
   }
 
   function playRemoteVideo() {
